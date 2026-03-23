@@ -101,290 +101,114 @@ We evaluated five approaches for auto-generating MCP tools from API specs:
 | Dimension | OpenAPI | GraphQL | gRPC/Protobuf | AsyncAPI | Custom SDK |
 |-----------|---------|---------|---------------|----------|------------|
 | **Tool Generation** | ✅ Easy — FastMCP `OpenAPIProvider` ready | 🟡 Moderate — requires introspection mapping | 🔴 Hard — needs codegen + HTTP proxy | 🟡 Moderate — no native MCP support | 🔴 Manual — fully custom |
-| **Schema Expressiveness** | ✅ High — full JSON Schema | ✅ High — typed SDL | ✅ High — Protobuf | ✅ High — JSON Schema messages | ⚪ Unlimited but no standard |
-| **Auth Support** | ✅ Native (OAuth2, API Keys, JWT) | 🟡 Ad-hoc, not in spec | ✅ TLS + token at transport | ✅ `securitySchemes` in spec | 🔴 Custom only |
-| **Runtime Performance** | 🟡 Medium — HTTP/JSON overhead | 🟢 Good — single endpoint | ✅ Best — HTTP/2 + binary | ⚪ Variable — broker-dependent | ⚪ Depends on impl |
-| **Tooling Ecosystem** | ✅ Very large — Swagger UI, codegen, etc. | 🟢 Growing — Apollo, GraphiQL | ✅ Large — official protoc tools | 🟡 Moderate — still niche | 🔴 None — DIY |
-| **LLM Suitability** | 🟢 Good — each endpoint = 1 tool | ✅ Excellent — fetches exactly what's needed | 🔴 Limited — LLMs rarely call gRPC | 🔴 Poor — async/pub-sub mismatch | ⚪ Flexible but manual |
+# Model Context Protocol (MCP) — Implementation Guide
 
-**Bottom Line:** OpenAPI is the best fit for LLM tooling on existing REST/Java stacks — broad ecosystem, easy codegen, and direct FastMCP support.
+This repository documents a practical approach to exposing Java REST APIs to language models via the Model Context Protocol (MCP) using FastMCP and OpenAPI. The goal is to provide a concise, production-oriented reference that engineering and data science teams can use to deploy a stable, secure MCP server.
 
----
+## Overview
 
-## 4. Why OpenAPI?
+MCP is a lightweight JSON-RPC protocol that exposes backend capabilities to AI agents as typed "tools". In this project FastMCP (Python) is used to:
 
-We chose OpenAPI for this project for three clear reasons:
+- Convert OpenAPI endpoints into MCP tools via an OpenAPI provider.
+- Validate inputs using generated JSON schemas.
+- Serve MCP over a streamable HTTP transport suitable for production.
 
-### ✅ Native to Java REST
-Our backend is Spring Boot. Libraries like `springdoc-openapi` auto-generate the Swagger spec from controller annotations — **no extra interface layer needed**. The spec stays in sync with the code.
+This approach minimizes backend changes: the Java service continues to serve REST endpoints while FastMCP provides the MCP facade.
 
-### ✅ CI/CD Ready
-OpenAPI fits directly into our existing pipelines:
-- Spec validation and linting (Spectral)
-- Client/stub generation (OpenAPI Generator, Maven plugin)
-- Auto-publishing to SwaggerHub
+## Key Concepts
 
-### ✅ FastMCP Out-of-the-Box
-```python
-from fastmcp.contrib.openapi import OpenAPIProvider
+- Tools: callable operations with specified input/output schemas.
+- Resources: contextual data served to clients as read-only objects.
+- Prompts: templated messages or examples provided to clients.
 
-provider = OpenAPIProvider(
-    openapi_spec=spec_json,
-    client=httpx.AsyncClient(base_url=BASE_API_URL)
-)
-mcp = FastMCP("Petstore MCP", providers=[provider])
-```
-Every new REST endpoint in the Java service **automatically becomes an MCP tool** after the next spec refresh — zero manual coding.
+## Why OpenAPI
 
-### ⚠️ Known Trade-off
-Large APIs produce many fine-grained tools. This can overwhelm LLMs with too many options. Mitigation: use FastMCP route filters or combine related endpoints into higher-level tools later.
+OpenAPI is chosen because it:
 
----
+- Integrates directly with Java (Spring) stacks through tools like springdoc.
+- Is well supported by CI/CD workflows (linting, generator tooling).
+- Provides rich, machine-readable schemas that FastMCP can convert into tools without manual wiring.
 
-## 5. Dynamic Refresh Strategies
+OpenAPI is pragmatic for teams that already maintain REST APIs. For larger APIs, consider curating or combining endpoints to avoid cognitive load for agents.
 
-APIs evolve. A static MCP server becomes outdated. Here are four strategies to keep tools in sync:
+## Dynamic Refresh: Keeping Tools in Sync
 
-### 5.1 Periodic Polling *(Simple — Recommended Start)*
-Fetch the spec on a schedule and swap the provider if it changed.
+APIs change. The MCP layer must reflect those changes. Common refresh patterns:
 
-```python
-async def refresh_loop():
-    while True:
-        await asyncio.sleep(POLL_INTERVAL)  # e.g. 300 seconds
-        try:
-            new_spec = httpx.get(OPENAPI_URL).json()
-            new_provider = OpenAPIProvider(openapi_spec=new_spec, client=api_client)
-            async with lock:
-                mcp.providers = [new_provider]
-            log.info("Spec refreshed successfully")
-        except Exception as e:
-            log.error("Refresh failed — keeping old provider", exc_info=e)
-```
+1. Polling loop: fetch the OpenAPI spec at a configured interval and rebuild the provider if the spec differs.
+2. Hash detection: compute a stable hash of the spec and act only on changes to avoid unnecessary reloads.
+3. Webhook trigger: CI/CD notifies the MCP server when a new API deploys; the server validates and refreshes.
+4. Manual trigger: an administrative MCP tool or an authenticated HTTP route can force a refresh.
 
-**Failure handling:** On error, the old provider stays active. The server never crashes.
+Implementation notes:
 
----
+- Always validate the new spec before swapping providers.
+- Use an async lock to perform atomic swaps so callers see a consistent tool set.
+- Keep a reference to the previous provider for quick rollback if the new one fails.
 
-### 5.2 Hash-Change Detection *(Efficient)*
-Only rebuild the provider when the spec has actually changed.
+## Production Considerations
 
-```python
-last_hash = None
+Essentials for a production deployment:
 
-async def refresh_if_changed():
-    global last_hash
-    spec = httpx.get(OPENAPI_URL).json()
-    new_hash = md5(json.dumps(spec, sort_keys=True).encode()).hexdigest()
-    if new_hash == last_hash:
-        return  # No change — skip rebuild
-    last_hash = new_hash
-    # Rebuild provider ...
-```
+- Containerize the MCP server (Python 3.11 slim). Use environment variables for configuration (spec URL, API base URL, refresh interval, secrets).
+- Expose health and metrics endpoints for readiness/liveness and Prometheus integration.
+- Require authentication on MCP endpoints and protect any refresh/webhook routes (secret header or mTLS).
+- Implement basic rate limiting and observability (structured logs, call latencies, error counts).
 
-**Benefit:** Avoids unnecessary CPU work and prevents spurious `tools/list_changed` notifications.
+Recommended environment variables:
 
----
+- `OPENAPI_URL` — URL to the OpenAPI JSON
+- `BASE_API_URL` — backend base URL used by the HTTP client
+- `MCP_REFRESH_INTERVAL` — polling interval in seconds
+- `MCP_SECRET` — secret for webhook-based refresh
 
-### 5.3 Webhook / CI Trigger *(Real-time)*
-Let the CI/CD pipeline call the MCP server when a new API version is deployed.
+## Security and Testing
 
-```python
-@mcp.custom_route("/refresh", methods=["POST"])
-async def webhook_refresh(request):
-    # Validate a secret header for auth
-    new_provider = await build_provider()
-    async with lock:
-        mcp.providers = [new_provider]
-    return JSONResponse({"status": "refreshed"})
-```
+- Protect incoming MCP calls with a bearer token or equivalent.
+- Store API credentials in a secrets manager, not in the repo.
+- Tests: unit tests for provider logic, integration tests for tool calls (using a mocked backend), and an end-to-end smoke test that verifies refresh behavior.
 
-**CI step example:**
-```bash
-curl -X POST https://mcp-server/refresh \
-     -H "X-Refresh-Secret: $MCP_SECRET"
-```
+## Quickstart
 
----
-
-### 5.4 Manual MCP Tool Refresh *(Admin Use)*
-Expose a special MCP tool that authorized clients can call to trigger a reload.
-
-```python
-@mcp.tool
-async def refresh_openapi():
-    """Admin: reload the OpenAPI spec and update available tools."""
-    new_provider = await build_provider()
-    async with lock:
-        mcp.providers = [new_provider]
-    return {"status": "ok", "tools_count": len(mcp.tools_list())}
-```
-
-> ⚠️ Protect this tool — hide it from the LLM's main tool list or require elevated permissions.
-
----
-
-### Strategy Comparison
-
-| Strategy | Latency | Complexity | Best For |
-|----------|---------|------------|----------|
-| Periodic Polling | Minutes | Low | Getting started |
-| Hash Detection | Minutes (efficient) | Low | Reducing noise |
-| Webhook Trigger | Seconds | Medium | CI/CD integrated teams |
-| Manual Tool | On-demand | Low | Dev/admin workflows |
-
----
-
-## 6. Production Design
-
-### Docker Setup
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY server.py .
-USER nobody
-CMD ["python", "server.py"]
-```
-
-```bash
-# requirements.txt
-fastmcp
-httpx
-prometheus-client
-```
-
-### Environment Variables
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `OPENAPI_URL` | URL to the OpenAPI JSON spec | `https://api.example.com/openapi.json` |
-| `BASE_API_URL` | Java REST API base URL | `https://api.example.com` |
-| `MCP_REFRESH_INTERVAL` | Polling interval in seconds | `300` |
-| `MCP_SECRET` | Auth secret for `/refresh` webhook | `s3cr3t` |
-| `LOG_LEVEL` | Logging verbosity | `INFO` |
-
-### Monitoring
-
-- **Logs:** Structured JSON logs → ELK / CloudWatch
-- **Metrics:** Prometheus via `/metrics` custom route
-  - Tool call count & latency
-  - Refresh success/failure rate
-  - Error rate per tool
-- **Health:** `/health` endpoint for Kubernetes readiness/liveness probes
-
-### Security Checklist
-
-- [ ] Bearer token auth on incoming MCP calls (`auth=BearerAuth(token)`)
-- [ ] Secret header validation on `/refresh` webhook endpoint
-- [ ] HTTPS only in production (TLS termination at load balancer)
-- [ ] Rate limiting middleware to prevent abuse
-- [ ] API credentials stored in env vars / secrets manager (never hardcoded)
-
-### Testing Strategy
-
-| Level | What to Test |
-|-------|-------------|
-| **Unit** | Individual tool functions, provider creation from mock spec |
-| **Integration** | Full tool calls via FastMCP client against a local container |
-| **End-to-End** | LLM agent using tools against live Petstore API |
-| **Refresh** | Modify mock spec, verify new tools appear after refresh |
-
----
-
-## 7. Demo & Quickstart
-
-### Prerequisites
+1. Install dependencies (recommended in a virtual environment):
 
 ```bash
 pip install fastmcp httpx
 ```
 
-### Run the Server
+2. Configure environment variables (example):
 
 ```bash
 export OPENAPI_URL="https://petstore3.swagger.io/api/v3/openapi.json"
 export BASE_API_URL="https://petstore3.swagger.io"
 export MCP_REFRESH_INTERVAL=300
+export MCP_SECRET="replace-with-secret"
+```
 
+3. Start the server (example):
+
+```bash
 python server.py
 ```
 
-Expected output:
-```
-INFO  Connected to Java API at https://petstore3.swagger.io
-INFO  Loaded 20 tools from OpenAPI spec
-INFO  MCP server running on http://0.0.0.0:8000
-```
+4. Verify the server log shows the OpenAPI spec was loaded and tools were created. Use a FastMCP client to list and call tools.
 
-### Run the Client
+## Example refresh flow (high level)
 
-```bash
-python client.py
-```
+1. CI deploys a new Java API and updates OpenAPI JSON.
+2. CI calls the MCP webhook (`/refresh`) including the shared secret.
+3. MCP server fetches the updated spec, validates it, and atomically swaps the provider.
+4. MCP sends a `tools/list_changed` notification to connected clients (if negotiated).
 
-Expected output:
-```
-Connected to MCP Server
-Available tools (20):
-  • findPetsByStatus   — Finds Pets by status
-  • getPetById         — Find pet by ID
-  • addPet             — Add a new pet to the store
-  • updatePet          — Update an existing pet
-  ...
-```
+## Recommended Next Steps
 
-### Call a Tool
-
-```python
-result = await client.call_tool("findPetsByStatus", {"status": "available"})
-print(result)
-# [{"id": 1, "name": "Buddy", "status": "available"}, ...]
-```
-
-### Test Dynamic Refresh
-
-1. Add a new endpoint to your OpenAPI JSON (or wait for the next polling cycle)
-2. Watch the server logs: `INFO  Spec refreshed — 21 tools loaded`
-3. Re-list tools on the client: the new tool appears — **no restart needed**
-
----
-
-## 8. Trade-offs & Next Steps
-
-### Trade-offs
-
-| Decision | Pro | Con |
-|----------|-----|-----|
-| OpenAPI auto-generation | Zero manual coding per endpoint | Many fine-grained tools can overwhelm LLMs |
-| Polling refresh | Simple, self-contained | Up to N-minute delay for spec changes |
-| FastMCP OpenAPIProvider | Rapid integration | Tied to Python server for MCP layer |
-
-### Next Steps
-
-- 🔧 **Tool Curation** — Use FastMCP Transforms to filter, rename, or combine tools to reduce noise
-- 🔐 **OAuth2** — Integrate OAuth2 flows for Java API calls requiring delegated auth
-- 📊 **Metrics** — Add Prometheus instrumentation with Grafana dashboards
-- 🤖 **Agent Demo** — Build a LangChain or Claude agent that uses this MCP to answer natural language queries
-- 📉 **Usage Analytics** — Log which tools are called (and never called) to optimize the tool surface
-
----
+- Curate tools: reduce noise by combining or filtering endpoints exposed to agents.
+- Instrument metrics: track which tools are used and measure latencies and error rates.
+- Build an agent demo: a small LangChain or agent example that demonstrates multi-step usage of the MCP tools.
 
 ## Summary
 
-| What | Detail |
-|------|--------|
-| **Protocol** | MCP (Model Context Protocol) — JSON-RPC over HTTP |
-| **Framework** | FastMCP (Python) |
-| **Tool Source** | OpenAPI spec from Java Spring Boot backend |
-| **Refresh** | Periodic polling + hash detection + webhook support |
-| **Deployment** | Docker · Kubernetes · Prometheus monitoring |
-| **Auth** | Bearer token (MCP) + API key (backend) |
+This repository demonstrates a low-friction path to expose REST APIs to LLM agents using FastMCP and OpenAPI. The approach emphasizes minimal backend changes, predictable refresh behavior, and production readiness through authentication, monitoring, and tests.
 
-> This setup exposes a full Java REST API to LLM agents **without changing a single line of backend code** — just point FastMCP at your Swagger URL.
-
----
-
-*Last updated: March 2026*
+Last updated: March 2026
+@mcp.tool
